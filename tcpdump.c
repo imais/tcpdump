@@ -174,9 +174,13 @@ static int Wflag;			/* recycle output files after this number of files */
 static int WflagChars;
 static char *zflag = NULL;		/* compress each savefile using a specified command (like gzip or bzip2) */
 static int immediate_mode;
+static int throughput_tracking_mode;
 
 static int infodelay;
 static int infoprint;
+
+static long captured_bytes = 0L;
+struct timeval ts_start, ts_end;
 
 char *program_name;
 
@@ -210,6 +214,7 @@ static void show_devices_and_exit (void) __attribute__((noreturn));
 static void print_packet(u_char *, const struct pcap_pkthdr *, const u_char *);
 static void dump_packet_and_trunc(u_char *, const struct pcap_pkthdr *, const u_char *);
 static void dump_packet(u_char *, const struct pcap_pkthdr *, const u_char *);
+static void track_packet(u_char *, const struct pcap_pkthdr *, const u_char *);
 static void droproot(const char *, const char *);
 
 #ifdef SIGNAL_REQ_INFO
@@ -562,6 +567,7 @@ show_devices_and_exit (void)
 #define OPTION_VERSION		128
 #define OPTION_TSTAMP_PRECISION	129
 #define OPTION_IMMEDIATE_MODE	130
+#define OPTION_THROUGHPUT_TRACKING_MODE	131
 
 static const struct option longopts[] = {
 #if defined(HAVE_PCAP_CREATE) || defined(_WIN32)
@@ -596,6 +602,7 @@ static const struct option longopts[] = {
 #ifdef HAVE_PCAP_SET_IMMEDIATE_MODE
 	{ "immediate-mode", no_argument, NULL, OPTION_IMMEDIATE_MODE },
 #endif
+	{ "throughput-tracking-mode", no_argument, NULL, OPTION_THROUGHPUT_TRACKING_MODE },
 #ifdef HAVE_PCAP_SET_PARSER_DEBUG
 	{ "debug-filter-parser", no_argument, NULL, 'Y' },
 #endif
@@ -1582,6 +1589,10 @@ main(int argc, char **argv)
 			break;
 #endif
 
+		case OPTION_THROUGHPUT_TRACKING_MODE:
+			throughput_tracking_mode = 1;
+			break;
+
 		default:
 			print_usage();
 			exit_tcpdump(1);
@@ -2015,6 +2026,10 @@ main(int argc, char **argv)
 		if (Uflag)
 			pcap_dump_flush(p);
 #endif
+    } else if (throughput_tracking_mode) {
+        callback = track_packet;
+        gettimeofday(&ts_start, NULL);
+        pcap_userdata = (u_char *)ndo;
 	} else {
 		dlt = pcap_datalink(pd);
 		ndo->ndo_if_printer = get_if_printer(ndo, dlt);
@@ -2298,6 +2313,15 @@ info(register int verbose)
 		    stats.ps_ifdrop, PLURAL_SUFFIX(stats.ps_ifdrop));
 	} else
 		putc('\n', stderr);
+
+    if (throughput_tracking_mode) {
+        gettimeofday(&ts_end, NULL);
+        double delta_sec =
+            (ts_end.tv_sec - ts_start.tv_sec) + (double)(ts_end.tv_usec - ts_start.tv_usec) * 1e-6;
+        fprintf(stderr, "%lu bytes captured, elapsed time %f s, throughput %f bytes/s\n",
+                captured_bytes, delta_sec, (double)captured_bytes / delta_sec);
+    }
+
 	infoprint = 0;
 }
 
@@ -2575,6 +2599,20 @@ dump_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *sp)
 }
 
 static void
+track_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *sp)
+{
+	++packets_captured;
+
+	++infodelay;
+
+    captured_bytes += h->len;
+
+	--infodelay;
+	if (infoprint)
+		info(0);
+}
+
+static void
 print_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *sp)
 {
 	++packets_captured;
@@ -2717,6 +2755,7 @@ print_usage(void)
 #ifdef HAVE_PCAP_SET_IMMEDIATE_MODE
 	(void)fprintf(stderr, "[ --immediate-mode ] ");
 #endif
+	(void)fprintf(stderr, "[ --throughput-tracking-mode ] ");
 	(void)fprintf(stderr, "[ -T type ] [ --version ] [ -V file ]\n");
 	(void)fprintf(stderr,
 "\t\t[ -w file ] [ -W filecount ] [ -y datalinktype ] [ -z postrotate-command ]\n");
