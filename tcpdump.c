@@ -174,13 +174,14 @@ static int Wflag;			/* recycle output files after this number of files */
 static int WflagChars;
 static char *zflag = NULL;		/* compress each savefile using a specified command (like gzip or bzip2) */
 static int immediate_mode;
-static int throughput_tracking_mode;
+static int throughput_tracking;
 
 static int infodelay;
 static int infoprint;
 
-static long captured_bytes = 0L;
-struct timeval ts_start, ts_end;
+static long captured_bytes = 0L, last_captured_bytes = 0L;
+struct timeval ts_start, ts_end, ts_last;
+static int throughput_tracking_interval_sec = -1;
 
 char *program_name;
 
@@ -216,6 +217,7 @@ static void dump_packet_and_trunc(u_char *, const struct pcap_pkthdr *, const u_
 static void dump_packet(u_char *, const struct pcap_pkthdr *, const u_char *);
 static void track_packet(u_char *, const struct pcap_pkthdr *, const u_char *);
 static void droproot(const char *, const char *);
+static void print_throughput(int signum);
 
 #ifdef SIGNAL_REQ_INFO
 RETSIGTYPE requestinfo(int);
@@ -567,7 +569,7 @@ show_devices_and_exit (void)
 #define OPTION_VERSION		128
 #define OPTION_TSTAMP_PRECISION	129
 #define OPTION_IMMEDIATE_MODE	130
-#define OPTION_THROUGHPUT_TRACKING_MODE	131
+#define OPTION_THROUGHPUT_TRACKING	131
 
 static const struct option longopts[] = {
 #if defined(HAVE_PCAP_CREATE) || defined(_WIN32)
@@ -602,7 +604,7 @@ static const struct option longopts[] = {
 #ifdef HAVE_PCAP_SET_IMMEDIATE_MODE
 	{ "immediate-mode", no_argument, NULL, OPTION_IMMEDIATE_MODE },
 #endif
-	{ "throughput-tracking-mode", no_argument, NULL, OPTION_THROUGHPUT_TRACKING_MODE },
+	{ "throughput-tracking", optional_argument, NULL, OPTION_THROUGHPUT_TRACKING },
 #ifdef HAVE_PCAP_SET_PARSER_DEBUG
 	{ "debug-filter-parser", no_argument, NULL, 'Y' },
 #endif
@@ -1211,6 +1213,9 @@ main(int argc, char **argv)
 	int yflag_dlt = -1;
 	const char *yflag_dlt_name = NULL;
 
+    struct sigaction sa;
+    struct itimerval timer;
+
 	netdissect_options Ndo;
 	netdissect_options *ndo = &Ndo;
 
@@ -1589,8 +1594,9 @@ main(int argc, char **argv)
 			break;
 #endif
 
-		case OPTION_THROUGHPUT_TRACKING_MODE:
-			throughput_tracking_mode = 1;
+		case OPTION_THROUGHPUT_TRACKING:
+			throughput_tracking = 1;
+            throughput_tracking_interval_sec = (optarg != NULL) ? atoi(optarg) : -1;
 			break;
 
 		default:
@@ -2026,10 +2032,18 @@ main(int argc, char **argv)
 		if (Uflag)
 			pcap_dump_flush(p);
 #endif
-    } else if (throughput_tracking_mode) {
+    } else if (throughput_tracking) {
         callback = track_packet;
         gettimeofday(&ts_start, NULL);
+        ts_last = ts_start;
         pcap_userdata = (u_char *)ndo;
+        
+        /* Call print_throughput periodically using alarm.
+           Avoid calling verbose_stats_dump() simultaneously. */
+        if (0 < throughput_tracking_interval_sec && !(ndo->ndo_vflag > 0 && WFileName)) {
+            (void)setsignal(SIGALRM, print_throughput);
+            alarm(throughput_tracking_interval_sec);
+        }
 	} else {
 		dlt = pcap_datalink(pd);
 		ndo->ndo_if_printer = get_if_printer(ndo, dlt);
@@ -2057,8 +2071,10 @@ main(int argc, char **argv)
 		timer_id = timeSetEvent(1000, 100, verbose_stats_dump, 0, TIME_PERIODIC);
 		setvbuf(stderr, NULL, _IONBF, 0);
 #elif defined(HAVE_ALARM)
-		(void)setsignal(SIGALRM, verbose_stats_dump);
-		alarm(1);
+        if (throughput_tracking_interval_sec < 0) {
+            (void)setsignal(SIGALRM, verbose_stats_dump);
+            alarm(1);
+        }
 #endif
 	}
 
@@ -2077,13 +2093,23 @@ main(int argc, char **argv)
 		dlt = pcap_datalink(pd);
 		dlt_name = pcap_datalink_val_to_name(dlt);
 		if (dlt_name == NULL) {
-			(void)fprintf(stderr, "listening on %s, link-type %u, capture size %u bytes\n",
+			(void)fprintf(stderr, "listening on %s, link-type %u, capture size %u bytes",
 			    device, dlt, ndo->ndo_snaplen);
 		} else {
-			(void)fprintf(stderr, "listening on %s, link-type %s (%s), capture size %u bytes\n",
+			(void)fprintf(stderr, "listening on %s, link-type %s (%s), capture size %u bytes",
 			    device, dlt_name,
 			    pcap_datalink_val_to_description(dlt), ndo->ndo_snaplen);
 		}
+        if (throughput_tracking) {
+            fprintf(stderr, ", throughput tracking");
+            if (0 < throughput_tracking_interval_sec) 
+                fprintf(stderr, " interval %d s\n", throughput_tracking_interval_sec);
+            else
+                fprintf(stderr, "\n");
+        }
+        else {
+            fprintf(stderr, "\n");
+        }
 		(void)fflush(stderr);
 	}
 
@@ -2314,7 +2340,7 @@ info(register int verbose)
 	} else
 		putc('\n', stderr);
 
-    if (throughput_tracking_mode) {
+    if (throughput_tracking) {
         gettimeofday(&ts_end, NULL);
         double delta_sec =
             (ts_end.tv_sec - ts_start.tv_sec) + (double)(ts_end.tv_usec - ts_start.tv_usec) * 1e-6;
@@ -2624,6 +2650,22 @@ print_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *sp)
 	--infodelay;
 	if (infoprint)
 		info(0);
+}
+
+static void 
+print_throughput(int signum)
+{
+	gettimeofday(&ts_end, NULL);
+    long delta_bytes = captured_bytes - last_captured_bytes;
+	double delta_sec =
+            (ts_end.tv_sec - ts_last.tv_sec) + (double)(ts_end.tv_usec - ts_last.tv_usec) * 1e-6;
+	/* fprintf(stderr, "%lu bytes captured, elapsed time %f s, throughput %f bytes/s\n", */
+    /*         delta_bytes, delta_sec, (double)delta_bytes / delta_sec); */
+	fprintf(stderr, "throughput: %f bytes/s\n", (double)delta_bytes / delta_sec);
+    last_captured_bytes = captured_bytes;
+	ts_last = ts_end;
+
+    alarm(throughput_tracking_interval_sec);
 }
 
 #ifdef _WIN32
