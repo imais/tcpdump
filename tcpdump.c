@@ -2797,8 +2797,8 @@ print_usage(void)
 #ifdef HAVE_PCAP_SET_IMMEDIATE_MODE
 	(void)fprintf(stderr, "[ --immediate-mode ] ");
 #endif
-	(void)fprintf(stderr, "[ --throughput-tracking-mode ] ");
-	(void)fprintf(stderr, "[ -T type ] [ --version ] [ -V file ]\n");
+	(void)fprintf(stderr, "[ --throughput-tracking seconds ]\n");
+	(void)fprintf(stderr, "\t\t[ -T type ] [ --version ] [ -V file ]\n");
 	(void)fprintf(stderr,
 "\t\t[ -w file ] [ -W filecount ] [ -y datalinktype ] [ -z postrotate-command ]\n");
 	(void)fprintf(stderr,
